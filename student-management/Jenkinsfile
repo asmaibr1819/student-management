@@ -1,0 +1,111 @@
+pipeline {
+    agent any
+
+    environment {
+        DOCKER_IMAGE = 'asmaibr/student-management-app'
+        DOCKER_TAG = 'latest'
+        SONAR_HOST_URL = 'http://localhost:9000'
+        K8S_NAMESPACE = 'devops'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                git branch: 'main',
+                    url: 'https://github.com/asmaibr1819/student-management.git'
+            }
+        }
+
+        stage('Build + SonarQube') {
+            steps {
+                dir('student-management') {
+                    withCredentials([string(
+                        credentialsId: 'sonarqube-token',
+                        variable: 'SONAR_TOKEN'
+                    )]) {
+                        sh '''
+                            echo "🔍 Build Maven + Analyse SonarQube"
+                            mvn clean package sonar:sonar \
+                              -Dsonar.projectKey=student-management-app \
+                              -Dsonar.projectName="Student Management App" \
+                              -Dsonar.host.url=${SONAR_HOST_URL} \
+                              -Dsonar.login=${SONAR_TOKEN} \
+                              -DskipTests
+                            echo "✅ Build et analyse terminés"
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                dir('student-management') {
+                    sh '''
+                        echo "🐳 Construction image Docker"
+                        docker build -t ${DOCKER_IMAGE}:${DOCKER_TAG} .
+                        echo "✅ Image Docker construite avec succès"
+                    '''
+                }
+            }
+        }
+
+        stage('Push Docker Hub') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'docker-hub-credentials',
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
+                    sh '''
+                        echo "📤 Poussée vers Docker Hub..."
+                        echo $DOCKER_PASS | docker login -u $DOCKER_USER --password-stdin
+                        docker push ${DOCKER_IMAGE}:${DOCKER_TAG}
+                        docker logout
+                        echo "✅ Image poussée sur Docker Hub"
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to Kubernetes') {
+            steps {
+                dir('student-management') {
+                    sh '''
+                        echo "🚀 Déploiement sur Kubernetes..."
+                        
+                        # Créer le namespace
+                        kubectl create namespace ${K8S_NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+                        
+                        # Appliquer toutes les configurations
+                        kubectl apply -f k8s/all-in-one.yaml
+                        
+                        echo "⏳ Attente du démarrage..."
+                        sleep 30
+                        
+                        # Vérification
+                        echo "📊 État des pods :"
+                        kubectl get pods -n ${K8S_NAMESPACE}
+                        
+                        echo "🌐 État des services :"
+                        kubectl get svc -n ${K8S_NAMESPACE}
+                        
+                        echo "✅ Déploiement Kubernetes terminé"
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "🎉 PIPELINE CI/CD COMPLÈTE RÉUSSIE"
+            echo "📊 SonarQube: ${SONAR_HOST_URL}/dashboard?id=student-management-app"
+            echo "🐳 Docker: ${DOCKER_IMAGE}:${DOCKER_TAG}"
+            echo "🚀 Kubernetes Namespace: ${K8S_NAMESPACE}"
+        }
+        always {
+            cleanWs()
+        }
+    }
+}
