@@ -1,3 +1,4 @@
+cat > Jenkinsfile << 'EOF'
 pipeline {
     agent any
 
@@ -9,6 +10,7 @@ pipeline {
     }
 
     stages {
+
         stage('Checkout') {
             steps {
                 git branch: 'main',
@@ -25,12 +27,14 @@ pipeline {
                     )]) {
                         sh '''
                             echo "🔍 Build Maven + Analyse SonarQube"
+
                             mvn clean package sonar:sonar \
                               -Dsonar.projectKey=student-management-app \
                               -Dsonar.projectName="Student Management App" \
                               -Dsonar.host.url=${SONAR_HOST_URL} \
                               -Dsonar.login=${SONAR_TOKEN} \
                               -DskipTests
+
                             echo "✅ Build et analyse terminés"
                         '''
                     }
@@ -43,7 +47,25 @@ pipeline {
                 dir('student-management') {
                     sh '''
                         echo "🐳 Construction image Docker"
+
+                        cat > Dockerfile << 'EOF'
+FROM maven:3.9-eclipse-temurin-17 AS builder
+WORKDIR /app
+COPY . .
+RUN mvn clean package -DskipTests
+
+FROM eclipse-temurin:17-jre
+WORKDIR /app
+COPY --from=builder /app/target/*.jar app.jar
+EXPOSE 8089
+ENTRYPOINT ["java", "-jar", "app.jar"]
+EOF
+
+                        echo "📄 Contenu du Dockerfile :"
+                        cat Dockerfile
+                        
                         docker build -t ${DOCKER_IMAGE}:${DOCKER_TAG} .
+                        
                         echo "✅ Image Docker construite avec succès"
                     '''
                 }
@@ -67,20 +89,20 @@ pipeline {
                 }
             }
         }
-
+        
         stage('Deploy to Kubernetes') {
             steps {
                 dir('student-management') {
                     sh '''
                         echo "🚀 Déploiement sur Kubernetes..."
                         
-                        # Créer le namespace
+                        # Créer le namespace s'il n'existe pas
                         kubectl create namespace ${K8S_NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
                         
-                        # Appliquer toutes les configurations
+                        # Appliquer les configurations YAML
                         kubectl apply -f k8s/all-in-one.yaml
                         
-                        echo "⏳ Attente du démarrage..."
+                        echo "⏳ Attente du démarrage des pods..."
                         sleep 30
                         
                         # Vérification
@@ -95,17 +117,56 @@ pipeline {
                 }
             }
         }
+        
+        stage('Verify Deployment') {
+            steps {
+                sh '''
+                    echo "🧪 Vérification du déploiement..."
+                    
+                    # Vérifier que les pods sont prêts
+                    timeout 120 bash -c "until kubectl get pods -n ${K8S_NAMESPACE} -l app=spring-app 2>/dev/null | grep -q Running; do sleep 5; echo '⏳ En attente des pods...'; done"
+                    
+                    # Vérifier les logs
+                    echo "📋 Derniers logs de l'application :"
+                    kubectl logs deployment/spring-app -n ${K8S_NAMESPACE} --tail=10 2>/dev/null || echo "⚠️ Logs non encore disponibles"
+                    
+                    # Obtenir l'URL du service
+                    echo "🔗 Pour accéder à l'application :"
+                    echo "   minikube service spring-service -n ${K8S_NAMESPACE} --url"
+                '''
+            }
+        }
     }
 
     post {
         success {
             echo "🎉 PIPELINE CI/CD COMPLÈTE RÉUSSIE"
             echo "📊 SonarQube: ${SONAR_HOST_URL}/dashboard?id=student-management-app"
-            echo "🐳 Docker: ${DOCKER_IMAGE}:${DOCKER_TAG}"
+            echo "🐳 Image Docker: ${DOCKER_IMAGE}:${DOCKER_TAG}"
             echo "🚀 Kubernetes Namespace: ${K8S_NAMESPACE}"
+            echo "📋 Commandes de vérification :"
+            echo "   kubectl get pods -n ${K8S_NAMESPACE}"
+            echo "   kubectl get svc -n ${K8S_NAMESPACE}"
+            echo "   kubectl logs deployment/spring-app -n ${K8S_NAMESPACE} --tail=20"
+        }
+        failure {
+            echo "❌ PIPELINE ÉCHOUÉE"
+            echo "Derniers logs d'erreur :"
+            sh '''
+                echo "=== Événements Kubernetes ==="
+                kubectl get events -n ${K8S_NAMESPACE} --sort-by='.lastTimestamp' | tail -20 2>/dev/null || echo "Aucun événement"
+                echo "=== Logs de l'application ==="
+                kubectl logs deployment/spring-app -n ${K8S_NAMESPACE} --tail=50 2>/dev/null || echo "Aucun log disponible"
+            '''
         }
         always {
             cleanWs()
+            sh '''
+                echo "🧹 Nettoyage des conteneurs de test..."
+                docker stop test-app 2>/dev/null || true
+                docker rm test-app 2>/dev/null || true
+            '''
         }
     }
 }
+EOF
